@@ -1,0 +1,370 @@
+---
+title: "ML Final Project - Medical Student Mental Health and Burnout Levels"
+author: "Group 3: Haoran Lu, Emma Krolicki"
+date: "2024-04-15"
+output: pdf_document
+---
+
+# Loading required packages
+```{r, warning = FALSE, message = FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(caret)
+library(ISLR2)
+library(randomForest)
+library(ltm)
+library(scales)
+library(ROSE)
+library(smotefamily)
+library(pROC)
+library(gbm)
+```
+
+# Reading and recoding the dataset
+```{r}
+# Reading dataset and notebook
+data <- read.csv("Data Carrard et al. 2022 MedTeach.csv")
+codebook <- read.csv2("Codebook Carrard et al. 2022 MedTeach.csv")
+# id (Any duplicates)
+anyDuplicated(data$id) # No
+# age (Should be normal age)
+summary(data$age) # 17 to 49, OK
+# year (Should be 1 to 6)
+summary(data$year) # True
+# sex (Should be 1, 2, or 3)
+table(data$sex) # True
+# glang (Should be one of the languages)
+table(data$glang) # True, but too many languages for data analysis
+# part (Should be 0 or 1)
+table(data$part) # True
+# job (Should be 0 or 1)
+table(data$job) # True
+# stud_h (Hours per week, should be considered "normal")
+summary(data$stud_h) # 0 to 70. Max = 70, could be a hard working student
+# health (Should be 1 to 5)
+table(data$health) # True
+# psyt (Should be 0 or 1)
+table(data$psyt) # True
+# jspe (Should be 20 to 140)
+summary(data$jspe) # True
+# qcae_cog (Should be 19 to 76)
+summary(data$qcae_cog) # True
+# qcae_aff (Should be 12 to 48)
+summary(data$qcae_aff) # True
+# amsp (Should be 5 to 35)
+summary(data$amsp) # True
+# erec_mean (Should be 0 to 1)
+summary(data$erec_mean) # True
+# cesd (Should be 0 to 60)
+summary(data$cesd) # True
+# stai_t (Should be 20 to 80)
+summary(data$stai_t) # True
+# mbi_ex (Should be 0 to 30)
+summary(data$mbi_ex) # True
+# mbi_cy (Should be 0 to 24)
+summary(data$mbi_cy) # True
+# mbi_ea (Should be 0 to 36)
+summary(data$mbi_ea) # True
+
+# Specifying columns needed recoding
+c <- c(3,4,5,6,7,9,10)
+
+# Recoding funtion
+apply_recoding <- function(data, codebook) {
+  for (i in c) {
+    variable <- codebook$Variable.Name[i]
+    scale_info <- codebook$Variable.Scale[i]
+    
+    parts <- strsplit(scale_info, "; ")[[1]]
+    recode_list <- setNames(
+    lapply(parts, function(x) strsplit(x, "=")[[1]][2]),
+    lapply(parts, function(x) strsplit(x, "=")[[1]][1])
+      )
+    recode_list <- unlist(recode_list)
+    data[[variable]] <- recode(data[[variable]], !!!recode_list)
+    }
+   return(data)
+}
+
+# Recoding dataset
+data <- apply_recoding(data, codebook)
+```
+
+### Define burnout level as dichotomous variable
+# Burnout level was defined by both high emotional exhaustion (>26) and high depersonalization (>12)
+# Williamson, K., Lank, P. M., Cheema, N., Hartman, N., Lovell, E. O., & Emergency Medicine Education Research Alliance (EMERA) (2018). Comparing the Maslach Burnout Inventory to Other Well-Being Instruments in Emergency Medicine Residents. Journal of graduate medical education, 10(5), 532–536.
+
+# Reverse recoding for mbi_ea, add three tests up as a new continuous variable indicating burnout
+# https://www.sciencedirect.com/science/article/pii/S0738399121003918#sec0010
+```{r}
+# Reverse mbi_ea
+data$mbi_ea_re <- (36 - data$mbi_ea)
+data$mbi_total <- (data$mbi_cy + data$mbi_ea_re + data$mbi_ex)
+
+# Binary classification
+data$burnout <- ifelse(data$mbi_ex >= 26 & data$mbi_cy >= 12, "Yes", "No")
+data$burnout <- as.factor(data$burnout)
+
+# Recoding of `glang` less than 10 as `Other`
+data$glang <- ifelse(table(data$glang)[data$glang] > 10, 
+                            as.character(data$glang), "Other")
+table(data$glang)%>%sort(decreasing = T)
+
+data$sex <- factor(data$sex)
+data$health <- factor(data$health)
+data$year <- factor(data$year)
+data$part <- factor(data$part)
+data$job <- factor(data$job)
+data$psyt <- factor(data$psyt)
+data$glang <- factor(data$glang)
+data$burnout <- factor(data$burnout, levels = c("No", "Yes"))
+```
+
+# Descriptive analysis of the dataset
+```{r}
+# Distribution of values in column with categorical data
+cat_var <- c(3,4,5,6,7,9,10,23)
+cat_col_names <- names(data)[cat_var]
+
+# Plotting each categorical column with percentages
+for (col in cat_col_names) {
+  ggplot(data = data, aes_string(x = col, fill = col)) + 
+    geom_bar() + 
+    geom_text(aes(label = scales::percent(..count../sum(..count..))), 
+              position = position_fill(vjust = 0.5), stat = "count") +
+    scale_y_continuous(labels = scales::percent_format()) +
+    theme_minimal() +
+    labs(title = paste("Percentage Bar Chart of", "'", col, "'"),
+         x = col, y = "Percentage") +
+    theme(plot.title = element_text(hjust = 0.5)) -> p
+  print(p)
+}
+
+# Correlation between `mbi_total` and other numeric variables
+library(dplyr)
+library(corrplot)
+data_num <- data %>% select_if(is.numeric)
+data_num <- data_num[,-c(1,11,12,13,14)]
+cor_matrix <- cor(data_num)
+col <- colorRampPalette(c("white", "red"))(200)
+corrplot(cor_matrix, col = col, 
+         method = "color", type = "upper", order = "hclust", 
+         tl.col = "black", tl.cex = 0.8, tl.srt = 45, 
+         addCoef.col = "black")
+
+# Distribution of mbi_total
+hist(data$mbi_total, 
+     main = "Histogram of `mbi_total`",
+     xlab = "`mbi_total`",
+     freq = FALSE,
+     breaks = 20,
+     col = "lightgray")
+curve(dnorm(x, mean = mean(data$mbi_total), 
+            sd = sd(data$mbi_total)), 
+      add = TRUE, col = "red", lwd = 2)
+```
+
+
+# Logistic regression
+```{r}
+set.seed(1)
+# Cross validation
+train_control <- trainControl(
+  method = "cv",  
+  number = 5,  
+  classProbs = TRUE,  
+  summaryFunction = twoClassSummary,  
+  savePredictions = "final",  
+  sampling = "up"  
+)
+
+# Fit the model
+model_cv <- train(
+  burnout ~ age + year + sex + glang + part + job + stud_h + health + psyt + 
+    jspe + qcae_cog + qcae_aff + amsp + erec_mean + cesd + stai_t,
+  data = data,
+  method = "glm",
+  family = "binomial",
+  trControl = train_control,
+  metric = "ROC"
+)
+
+# View model performance
+summary(model_cv)
+predictions <- predict(model_cv, newdata = data, type = "prob")
+prob_yes <- predictions[,2]
+roc_final <- roc(data$burnout, prob_yes)
+auc_lg <- auc(roc_final)
+ggroc(roc_final, size = 2, alpha = 0.5) +
+  ggtitle("ROC Curve for Predicting 'Burnout'") + 
+  geom_label(aes(x = 0.2, y = 0.2, label = sprintf("AUC = %.2f", auc_lg)), 
+                       fill = "white", 
+                       size = 6,       
+                       color = "black" 
+                      )
+
+final_model <- model_cv$finalModel
+pre_d <- predict(model_cv, newdata = data)
+conf_matrix <- confusionMatrix(pre_d, data$burnout, positive = "Yes")
+summary(final_model)
+
+# Oversampling
+data_balanced <- ovun.sample(burnout ~ ., 
+                             data = data, method = "over", 
+                             N = 1686, seed = 1)$data
+model_cv_balanced <- train(
+  burnout ~ age + year + sex + glang + part + job + stud_h + health + psyt + 
+    jspe + qcae_cog + qcae_aff + amsp + erec_mean + cesd + stai_t,
+  data = data_balanced,
+  method = "glm",
+  family = "binomial",
+  trControl = train_control,
+  metric = "ROC"
+)
+
+predictions_b <- predict(model_cv_balanced, newdata = data_balanced, 
+                         type = "prob")
+prob_yes_b <- predictions_b[,2]
+roc_final_b <- roc(data_balanced$burnout, prob_yes_b)
+auc_lg_b <- auc(roc_final_b)
+ggroc(roc_final_b, size = 2, alpha = 0.5) +
+  ggtitle("ROC Curve for Predicting 'Burnout'") + 
+  geom_label(aes(x = 0.2, y = 0.2, label = sprintf("AUC = %.2f", auc_lg_b)), 
+                       fill = "white", 
+                       size = 6,       
+                       color = "black" 
+                      )
+pre_d_b <- predict(model_cv_balanced, newdata = data_balanced)
+conf_matrix_b <- confusionMatrix(pre_d_b, data_balanced$burnout, 
+                               positive = "Yes")
+final_model_b <- model_cv_balanced$finalModel
+summary(final_model_b)
+```
+
+# Random forest models
+```{r}
+# Create training and testing sets
+split <- as.vector(createDataPartition(data$burnout, p = 0.8, list = FALSE))
+train_set <- data[split, ]
+test_set <- data[-split, ]
+
+# Randomforest model using all variables
+rf_1 <- randomForest(burnout ~ age + year + sex + glang + part + job + 
+                       stud_h + health + psyt + jspe + qcae_cog + qcae_aff +
+                       amsp + erec_mean + cesd + stai_t, 
+                     data = train_set, 
+                     ntree = 50, importance = TRUE)
+rf_1
+mean(predict(rf_1, newdata = train_set) == train_set$burnout)
+mean(predict(rf_1, newdata = test_set) == test_set$burnout)
+confusionMatrix(predict(rf_1, newdata = train_set), train_set$burnout)
+confusionMatrix(predict(rf_1, newdata = test_set), test_set$burnout)
+
+# Using balanced training set
+balan_rf <- ovun.sample(burnout ~ ., data = train_set, method = "over", 
+                        N = 1350, seed = 1)$data
+rf_2 <- randomForest(burnout ~ age + year + sex + glang + part + job + stud_h + 
+                       health + psyt + jspe + qcae_cog + qcae_aff + amsp + 
+                       erec_mean + cesd + stai_t, 
+                     data = balan_rf, 
+                     ntree = 50, importance = TRUE)
+rf_2
+plot(rf_2,
+     main = "Error Rate vs Number of Trees")
+mean(predict(rf_2, newdata = train_set) == train_set$burnout)
+mean(predict(rf_2, newdata = test_set) == test_set$burnout)
+confusionMatrix(predict(rf_2, newdata = test_set), test_set$burnout)
+```
+
+# Predicting burnout level as numeric variable
+```{r}
+set.seed(1)
+# Use randomForest to predict burnout level as numeric variable, balanced dataset
+rf_num <- randomForest(mbi_total ~ age + year + sex + glang + part + job + 
+                       stud_h + health + psyt + jspe + qcae_cog + qcae_aff +
+                       amsp + erec_mean + cesd + stai_t, 
+                       data = train_set, 
+                       ntree = 50, importance = TRUE)
+rf_num
+pred_rfn <- predict(rf_num, newdata = test_set)
+pred_rft <- predict(rf_num, newdata = train_set)
+MSE_test <- mean((pred_rfn - test_set$mbi_total)^2)
+mean((pred_rft - train_set$mbi_total)^2)
+
+# Calculate R^2 and RMSE using postResample
+R2_test <- postResample(pred = pred_rfn, obs = test_set$mbi_total)
+R2_train <- postResample(pred = pred_rft, obs = train_set$mbi_total)
+
+SSE <- sum((pred_rfn - test_set$mbi_total)^2)  
+SST <- sum((test_set$mbi_total - mean(test_set$mbi_total))^2)  
+R_squared <- 1 - SSE/SST
+n <- nrow(test_set)
+p <- length(rf_num$coefficients) - 1
+
+test_adjr2 <- 1 - ((1 - R_squared) * (n - 1) / (n - p - 1))
+
+# Unbalanced dataset
+rf_num_un <- randomForest(mbi_total ~ age + year + sex + glang + part + job + 
+                       stud_h + health + psyt + jspe + qcae_cog + qcae_aff +
+                       amsp + erec_mean + cesd + stai_t, 
+                       data = train_set, 
+                       ntree = 50, importance = TRUE)
+
+mean((predict(rf_num_un, newdata = train_set) - train_set$mbi_total)^2)
+mean((predict(rf_num_un, newdata = test_set) - test_set$mbi_total)^2)
+pred_rfn2 <- predict(rf_num_un, newdata = test_set)
+
+# Calculate R^2 and RMSE using postResample
+results2 <- postResample(pred = pred_rfn2, obs = test_set$mbi_total)
+
+SSE <- sum((pred_rfn2 - test_set$mbi_total)^2)  
+SST <- sum((test_set$mbi_total - mean(test_set$mbi_total))^2)  
+R_squared <- 1 - SSE/SST
+n <- nrow(test_set)
+p <- length(rf_num_un$coefficients) - 1
+
+test_adjr22 <- 1 - ((1 - R_squared) * (n - 1) / (n - p - 1))
+
+# Gradient boosting 
+train_set[] <- lapply(train_set, 
+                      function(x) if(is.character(x)) factor(x) else x)
+test_set[] <- lapply(test_set, 
+                     function(x) if(is.character(x)) factor(x) else x)
+gbm_1 <- gbm(mbi_total ~ age + year + sex + glang + part + job + 
+                       stud_h + health + psyt + jspe + qcae_cog + qcae_aff +
+                       amsp + erec_mean + cesd + stai_t,
+             data = train_set,  
+             distribution = "gaussian",  
+             n.trees = 500,  
+             interaction.depth = 1,  
+             cv.folds = 5)
+
+gbm1_test <- predict(gbm_1, newdata = test_set, n.trees = 500)
+r2_po_test <- postResample(pred = gbm1_test, obs = test_set$mbi_total)
+MSE_boost <- mean((gbm1_test - test_set$mbi_total)^2)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
